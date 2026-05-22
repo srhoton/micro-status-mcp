@@ -1,0 +1,68 @@
+## Session prompts (chronological)
+
+### 1. Initial request
+
+> In this repo we have just a basic template for a Go app. What we want to build is the following:
+>
+> Look at the ~/git/dotfiles directory. It implements a inbox/message tool for claude sessions for repos to talk to each other. It is augmented with a tmux 'send-keys' functionality to send messages to the tmux session and have it execute commands.
+>
+> What we would like to do is build a small mcp server, in Go, that listens for messages from the claude sessions and then sends them to the other claude session. It can continue to use the tmux 'send-keys' functionality to send messages to the tmux session and have it execute commands, but what we want to do is have the mcp server listen for messages from the claude sessions and then send them to the other claude session, removing the filesystem dependency. Can you think through how we would implement this?
+
+### 2. Plan-mode design decisions (via AskUserQuestion)
+
+- **Persistence:** SQLite single-file (one ~/.claude/micro-status-mcp/state.db).
+- **MCP library:** modelcontextprotocol/go-sdk (official).
+- **Scope:** Server + cutover slash commands (build the MCP server AND update /post-msg, /inbox, and the SessionStart hook in dotfiles to use it).
+- **Lifecycle:** Manual + tmux pane (`micro-status-mcp serve` in a dedicated tmux pane).
+
+### 3. Execute
+
+> start now
+
+### 4. Run multi-pass review
+
+> /review
+
+(Comprehensive review dispatched four reviewers — functional, code-quality, ADR-compliance, performance — in parallel.)
+
+### 5. Fix scope decision
+
+> Fix all issues not tagged as 'adr' related.
+
+(All findings except [22] ADR-20260120 (Prefixed Base62 Entity Identifiers) were addressed across two rounds of fixes plus a corrective third round for a regression introduced by the SetMaxOpenConns(4) change on :memory: DSNs.)
+
+### 6. True up
+
+> ok. Please commit your work, add prompts in this session to the commit via git notes, push it, and using your github mcp integration, create a PR.
+
+## Summary of work performed
+
+Two fix iterations on top of the initial implementation:
+
+**Round 1 (21 findings, 1-21):**
+- serve.go lifecycle: sync.WaitGroup gates listener goroutine with Shutdown; 0o700 state dir; IdleTimeout=120s.
+- MCP handler: StreamableHTTPOptions{SessionTimeout: 5*time.Minute} prevents idle-session leak.
+- tmuxnotify: per-call 2s ExecTimeout; ErrTmuxUnavailable vs ErrPaneMissing split via classifyTmuxError; sanitizeSubject strips CR/LF/control chars and truncates to 200.
+- store: WAL + busy_timeout(5000) + synchronous(NORMAL) + foreign_keys(on) pragmas; INTEGER unix-nanos timestamps; partial index on (to_repo, posted_at_ns, id) WHERE read_at_ns IS NULL; ListOptions{Limit, SinceID, IncludeRead}; non-nil empty slices.
+- tools: dropped dead nil checks; per-field requireFields(); MaxBodyBytes=1 MiB; pagination wired through to MCP.
+- CLI: typed server.*Params structs (no map[string]any); dialTimeout/callTimeout constants; defaultEndpoint computed from defaultAddr+mcpPath; resolveBody refactored with io.LimitReader and an injectable stdin.
+- Tests: cli/post_test.go (resolveBody matrix), cli/root_test.go (subcommand wiring), durability test (Open, write, close, reopen, assert).
+
+**Round 2 (11 findings):**
+- HTTP body cap moved to http.MaxBytesHandler at 4 MiB — protects against pre-SDK io.ReadAll DoS.
+- DB pool 1 -> 4 (with WAL fan-out), then later gated by DSN so :memory: stays at 1.
+- mergeDefaultPragmas parses query and adds defaults per-pragma; previously a single caller-supplied _pragma suppressed all defaults.
+- tmuxnotify drops the list-panes preflight; goes straight to send-keys and classifies the error.
+- sanitizeSubject truncates at rune boundaries (utf8.DecodeRuneInString) so multi-byte codepoints aren't split.
+- Service.notify: derived context.WithTimeout(Background, 2s) for the prune so client cancellation can't block hygiene. Logs only when removed==true.
+- ListMessages gained OmitBody (server-side `"" AS body`); MarkReadBulk added (chunked at 500 ids).
+- mark_read_bulk MCP tool + --omit-body and bulk mark in `list --mark-read`.
+- cli/serve_test.go: clean-shutdown and bind-failure coverage.
+
+**Round 3 (regression fix for new HIGH from the round-2 reviewer):**
+- :memory: DSN + maxOpenConns=4 broke isolation (modernc/sqlite gives each conn a private DB) — added poolSizeFor(dsn) to pin :memory: to 1.
+- DeleteSessionByPane closes the TOCTOU window where a re-registration during the post could be clobbered by the prune.
+- mark_read_bulk capped at MaxListLimit.
+- Replaced hand-rolled UTF-8 decoder in test with unicode/utf8 stdlib.
+
+Final state: `go vet`, `gofmt -s -l .`, and `go test ./... -race -count=1` all clean across four packages.
