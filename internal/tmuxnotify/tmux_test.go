@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -36,19 +37,40 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte
 
 func TestNotify_Success(t *testing.T) {
 	r := &fakeRunner{
-		results: []runResult{{}}, // send-keys succeeds
+		results: []runResult{{}, {}}, // both send-keys calls succeed
 	}
-	n := &Notifier{Runner: r}
+	// Tiny settle so the test does not wait the full default delay.
+	n := &Notifier{Runner: r, SettleDelay: time.Microsecond}
 	if err := n.Notify(context.Background(), "main:0.1", "alpha", "hello"); err != nil {
 		t.Fatalf("Notify: %v", err)
 	}
 
-	if len(r.calls) != 1 {
-		t.Fatalf("expected 1 tmux call (send-keys only), got %d", len(r.calls))
+	if len(r.calls) != 2 {
+		t.Fatalf("expected 2 tmux calls (type then submit), got %d", len(r.calls))
 	}
-	wantSend := call{name: "tmux", args: []string{"send-keys", "-t", "main:0.1", "/inbox  # new from alpha: hello", "Enter"}}
-	if !reflect.DeepEqual(r.calls[0], wantSend) {
-		t.Errorf("send-keys call: got %+v, want %+v", r.calls[0], wantSend)
+	wantType := call{name: "tmux", args: []string{"send-keys", "-t", "main:0.1", "/inbox  # new from alpha: hello"}}
+	if !reflect.DeepEqual(r.calls[0], wantType) {
+		t.Errorf("type call: got %+v, want %+v", r.calls[0], wantType)
+	}
+	wantEnter := call{name: "tmux", args: []string{"send-keys", "-t", "main:0.1", "Enter"}}
+	if !reflect.DeepEqual(r.calls[1], wantEnter) {
+		t.Errorf("submit call: got %+v, want %+v", r.calls[1], wantEnter)
+	}
+}
+
+func TestNotify_NoEnterWhenTypeFails(t *testing.T) {
+	// If typing the message fails (pane gone), we must NOT send a stray Enter.
+	r := &fakeRunner{
+		results: []runResult{
+			{out: []byte("can't find pane: main:0.99"), err: errors.New("exit status 1")},
+		},
+	}
+	n := &Notifier{Runner: r, SettleDelay: time.Microsecond}
+	if err := n.Notify(context.Background(), "main:0.99", "alpha", "hello"); !errors.Is(err, ErrPaneMissing) {
+		t.Fatalf("expected ErrPaneMissing, got %v", err)
+	}
+	if len(r.calls) != 1 {
+		t.Errorf("expected exactly 1 tmux call (type only, no Enter), got %d", len(r.calls))
 	}
 }
 
