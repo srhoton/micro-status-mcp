@@ -16,6 +16,12 @@ import (
 // never block the request path indefinitely.
 const DefaultExecTimeout = 2 * time.Second
 
+// DefaultSettleDelay is the pause between send-keying the message text and
+// send-keying Enter. It gives the recipient's input box time to finish
+// ingesting the pasted text before the submit keystroke arrives, so the
+// Enter registers against the complete message rather than racing it.
+const DefaultSettleDelay = 100 * time.Millisecond
+
 // maxSubjectLen bounds the length of the subject we send-key into the
 // recipient pane. Anything longer is truncated.
 const maxSubjectLen = 200
@@ -51,6 +57,9 @@ type Notifier struct {
 	Runner Runner
 	// ExecTimeout overrides DefaultExecTimeout. Zero means use the default.
 	ExecTimeout time.Duration
+	// SettleDelay overrides DefaultSettleDelay, the pause between typing the
+	// message and submitting Enter. Zero means use the default.
+	SettleDelay time.Duration
 }
 
 // New returns a Notifier backed by the real `tmux` binary.
@@ -65,14 +74,24 @@ func (n *Notifier) timeout() time.Duration {
 	return DefaultExecTimeout
 }
 
-// Notify sends `/inbox  # new from <sender>: <subject>` + Enter into the given
-// tmux pane (e.g. "main:0.1"). On ErrPaneMissing the caller should prune the
-// session registration; on ErrTmuxUnavailable it should not (tmux may come
-// back online).
+func (n *Notifier) settle() time.Duration {
+	if n.SettleDelay > 0 {
+		return n.SettleDelay
+	}
+	return DefaultSettleDelay
+}
+
+// Notify sends `/inbox  # new from <sender>: <subject>` into the given tmux
+// pane (e.g. "main:0.1") and then submits it with Enter. On ErrPaneMissing the
+// caller should prune the session registration; on ErrTmuxUnavailable it should
+// not (tmux may come back online).
 //
-// tmux send-keys already returns a recognizable non-zero exit when the target
-// pane is missing, so we go straight to send-keys (one fork/exec) and
-// classify failures by stderr.
+// The text and the Enter are sent as two separate send-keys calls with a short
+// settle delay in between. Combining them into a single `send-keys <msg> Enter`
+// races the recipient input box's paste handling: the Enter can arrive before
+// the box finishes ingesting the text, leaving the message typed but never
+// submitted. tmux send-keys returns a recognizable non-zero exit when the
+// target pane is missing, so we classify failures from the first call by stderr.
 func (n *Notifier) Notify(ctx context.Context, pane, sender, subject string) error {
 	if pane == "" {
 		return fmt.Errorf("tmuxnotify: pane is required")
@@ -81,8 +100,22 @@ func (n *Notifier) Notify(ctx context.Context, pane, sender, subject string) err
 	sendCtx, cancel := context.WithTimeout(ctx, n.timeout())
 	defer cancel()
 	msg := fmt.Sprintf("/inbox  # new from %s: %s", sender, sanitizeSubject(subject))
-	out, err := n.Runner.Run(sendCtx, "tmux", "send-keys", "-t", pane, msg, "Enter")
-	if err != nil {
+
+	// Call 1: type the message text (no Enter).
+	if out, err := n.Runner.Run(sendCtx, "tmux", "send-keys", "-t", pane, msg); err != nil {
+		return classifyTmuxError(out, err)
+	}
+
+	// Let the input box settle before submitting so Enter registers against
+	// the fully-pasted text. Abort if the send context is already done.
+	select {
+	case <-sendCtx.Done():
+		return fmt.Errorf("%w: %v", ErrTmuxUnavailable, sendCtx.Err())
+	case <-time.After(n.settle()):
+	}
+
+	// Call 2: submit with Enter as a separate keystroke.
+	if out, err := n.Runner.Run(sendCtx, "tmux", "send-keys", "-t", pane, "Enter"); err != nil {
 		return classifyTmuxError(out, err)
 	}
 	return nil
